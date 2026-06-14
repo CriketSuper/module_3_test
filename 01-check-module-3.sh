@@ -476,20 +476,39 @@ check_3_ipsec() {
 
 firewall_router_ok() {
     local config="$1"
+    local wan_block
     local tunnel_block
-    local port
 
     contains "$config" "filter-map ipv4 $FIREWALL_MAP" || return 1
-    contains "$config" "interface $WAN_INTERFACE" || return 1
-    contains "$config" "set filter-map in $FIREWALL_MAP" || return 1
-    contains "$config" "set filter-map in $VPN_FILTER_MAP 5" || return 1
-    contains "$config" "set filter-map in $VPN_FILTER_MAP 10" || return 1
-    grep -Eq 'match udp any eq 53 ' <<< "$config" || return 1
-    grep -Eq 'match udp any eq 123 ' <<< "$config" || return 1
+    grep -Eq 'match tcp any (any eq|eq) 80([[:space:]]|$)' \
+        <<< "$config" || return 1
+    grep -Eq 'match tcp any (any eq|eq) 443([[:space:]]|$)' \
+        <<< "$config" || return 1
+    grep -Eq 'match (tcp|udp) any (any eq|eq) 53([[:space:]]|$)' \
+        <<< "$config" || return 1
+    grep -Eq 'match udp any (any eq|eq) 123([[:space:]]|$)' \
+        <<< "$config" || return 1
     contains "$config" "match icmp any any" || return 1
-    for port in $ALLOWED_TCP_PORTS; do
-        contains "$config" "match tcp any any eq $port" || return 1
-    done
+
+    wan_block="$(
+        awk -v interface_name="$WAN_INTERFACE" '
+            $0 ~ "^interface[[:space:]]+" interface_name "[[:space:]]*$" {
+                inside = 1
+                next
+            }
+            inside && /^interface[[:space:]]+/ {
+                exit
+            }
+            inside && /^!/ {
+                exit
+            }
+            inside {
+                print
+            }
+        ' <<< "$config"
+    )"
+    grep -Eq "set filter-map in ${FIREWALL_MAP}([[:space:]]+[0-9]+)?([[:space:]]|$)" \
+        <<< "$wan_block" || return 1
 
     tunnel_block="$(
         awk -v interface_name="$TUNNEL_INTERFACE" '
@@ -511,23 +530,73 @@ firewall_router_ok() {
     ! contains "$tunnel_block" "set filter-map in $FIREWALL_MAP"
 }
 
+firewall_router_detail() {
+    local config="$1"
+    local -a missing=()
+
+    contains "$config" "filter-map ipv4 $FIREWALL_MAP" ||
+        missing+=("карта $FIREWALL_MAP")
+    grep -Eq 'match tcp any (any eq|eq) 80([[:space:]]|$)' \
+        <<< "$config" || missing+=("http")
+    grep -Eq 'match tcp any (any eq|eq) 443([[:space:]]|$)' \
+        <<< "$config" || missing+=("https")
+    grep -Eq 'match (tcp|udp) any (any eq|eq) 53([[:space:]]|$)' \
+        <<< "$config" || missing+=("dns")
+    grep -Eq 'match udp any (any eq|eq) 123([[:space:]]|$)' \
+        <<< "$config" || missing+=("ntp")
+    contains "$config" "match icmp any any" || missing+=("icmp")
+
+    if ! awk -v interface_name="$WAN_INTERFACE" -v map_name="$FIREWALL_MAP" '
+        $0 ~ "^interface[[:space:]]+" interface_name "[[:space:]]*$" {
+            inside = 1
+            next
+        }
+        inside && (/^interface[[:space:]]+/ || /^!/) {
+            exit
+        }
+        inside && $0 ~ "set filter-map in " map_name \
+            "([[:space:]]+[0-9]+)?([[:space:]]|$)" {
+            found = 1
+        }
+        END {
+            exit(found ? 0 : 1)
+        }
+    ' <<< "$config"; then
+        missing+=("назначение на $WAN_INTERFACE")
+    fi
+
+    if ((${#missing[@]} == 0)); then
+        printf 'соответствует'
+    else
+        local IFS=', '
+        printf 'нет: %s' "${missing[*]}"
+    fi
+}
+
 check_4_firewall() {
     local title="Межсетевой экран EcoRouter"
     local hq_config="$1"
     local br_config="$2"
     local hq_ok=no
     local br_ok=no
+    local hq_detail
+    local br_detail
 
     firewall_router_ok "$hq_config" && hq_ok=yes
     firewall_router_ok "$br_config" && br_ok=yes
+    hq_detail="$(firewall_router_detail "$hq_config")"
+    br_detail="$(firewall_router_detail "$br_config")"
 
     if [[ "$hq_ok$br_ok" == yesyes ]]; then
-        set_result 4 1 "$title" "Оба WAN-интерфейса защищены, обязательные протоколы разрешены"
+        set_result 4 1 "$title" \
+            "HQ-RTR и BR-RTR: WAN-фильтр разрешает http, https, dns, ntp и icmp; остальное блокируется политикой фильтра"
     elif [[ "$hq_ok" == yes || "$br_ok" == yes ]] ||
         { contains "$hq_config" "$FIREWALL_MAP" && contains "$br_config" "$FIREWALL_MAP"; }; then
-        set_result 4 0.5 "$title" "Фильтрация настроена, но одна из конфигураций неполна"
+        set_result 4 0.5 "$title" \
+            "HQ-RTR: $hq_detail; BR-RTR: $br_detail"
     else
-        set_result 4 0 "$title" "Межсетевой экран не обнаружен"
+        set_result 4 0 "$title" \
+            "HQ-RTR: $hq_detail; BR-RTR: $br_detail"
     fi
 }
 
@@ -768,10 +837,40 @@ check_11_fail2ban() {
     output="$(linux_remote "$HQ_SRV_IP" "
 systemctl is-active fail2ban 2>/dev/null || true
 fail2ban-client status sshd 2>/dev/null || true
-echo PORT:\$(fail2ban-client get sshd port 2>/dev/null)
-echo RETRY:\$(fail2ban-client get sshd maxretry 2>/dev/null)
-echo FIND:\$(fail2ban-client get sshd findtime 2>/dev/null)
-echo BAN:\$(fail2ban-client get sshd bantime 2>/dev/null)
+config=/etc/fail2ban/jail.d/sshd.local
+read_config_value() {
+    local key=\$1
+    awk -F= -v key=\"\$key\" '
+        /^[[:space:]]*\\[/ {
+            section = \$0
+            gsub(/^[[:space:]]*\\[|\\][[:space:]]*$/, \"\", section)
+            next
+        }
+        (section == \"DEFAULT\" || section == \"sshd\") {
+            name = \$1
+            gsub(/[[:space:]]/, \"\", name)
+            if (name == key) {
+                value = \$2
+                sub(/^[[:space:]]+/, \"\", value)
+                sub(/[[:space:]]+$/, \"\", value)
+                found = value
+            }
+        }
+        END {
+            print found
+        }
+    ' \"\$config\" 2>/dev/null
+}
+port=\$(fail2ban-client get sshd port 2>/dev/null || true)
+retry=\$(fail2ban-client get sshd maxretry 2>/dev/null || true)
+find=\$(fail2ban-client get sshd findtime 2>/dev/null || true)
+ban=\$(fail2ban-client get sshd bantime 2>/dev/null || true)
+[[ -n \"\$port\" ]] || port=\$(read_config_value port)
+[[ -n \"\$retry\" ]] || retry=\$(read_config_value maxretry)
+[[ -n \"\$find\" ]] || find=\$(read_config_value findtime)
+[[ -n \"\$ban\" ]] || ban=\$(read_config_value bantime)
+printf 'PORT:%s\nRETRY:%s\nFIND:%s\nBAN:%s\n' \
+    \"\$port\" \"\$retry\" \"\$find\" \"\$ban\"
 " 2>/dev/null)" || true
 
     if contains "$output" "active" &&
