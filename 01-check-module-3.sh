@@ -25,8 +25,7 @@ required_variables=(
     MON_DOMAIN GRAFANA_PORT PROMETHEUS_PORT NODE_EXPORTER_PORT
     GRAFANA_ADMIN_USER GRAFANA_ADMIN_PASSWORD ANSIBLE_DIR
     INVENTORY_PLAYBOOK INVENTORY_REPORT_DIR HQ_CLI_IP
-    FAIL2BAN_SSH_PORT FAIL2BAN_MAX_RETRY FAIL2BAN_FIND_TIME
-    FAIL2BAN_BAN_TIME AUTO_INSTALL
+    AUTO_INSTALL
 )
 
 for variable_name in "${required_variables[@]}"; do
@@ -476,21 +475,39 @@ check_3_ipsec() {
 
 firewall_router_ok() {
     local config="$1"
+    local wan_block
     local tunnel_block
-    local port
 
     contains "$config" "filter-map ipv4 $FIREWALL_MAP" || return 1
-    contains "$config" "interface $WAN_INTERFACE" || return 1
-    contains "$config" "set filter-map in $FIREWALL_MAP" || return 1
-    contains "$config" "set filter-map in $VPN_FILTER_MAP 5" || return 1
-    contains "$config" "set filter-map in $VPN_FILTER_MAP 10" || return 1
-    contains "$config" "no set filter-map in $VPN_FILTER_MAP 15" || return 1
-    grep -Eq 'match udp any eq 53 ' <<< "$config" || return 1
-    grep -Eq 'match udp any eq 123 ' <<< "$config" || return 1
+    grep -Eqi 'match tcp any (any eq|eq) (80|http)([[:space:]]|$)' \
+        <<< "$config" || return 1
+    grep -Eqi 'match tcp any (any eq|eq) (443|https)([[:space:]]|$)' \
+        <<< "$config" || return 1
+    grep -Eqi 'match (tcp|udp) any (any eq|eq) (53|dns|domain)([[:space:]]|$)' \
+        <<< "$config" || return 1
+    grep -Eqi 'match udp any (any eq|eq) (123|ntp)([[:space:]]|$)' \
+        <<< "$config" || return 1
     contains "$config" "match icmp any any" || return 1
-    for port in $ALLOWED_TCP_PORTS; do
-        contains "$config" "match tcp any any eq $port" || return 1
-    done
+
+    wan_block="$(
+        awk -v interface_name="$WAN_INTERFACE" '
+            $0 ~ "^interface[[:space:]]+" interface_name "[[:space:]]*$" {
+                inside = 1
+                next
+            }
+            inside && /^interface[[:space:]]+/ {
+                exit
+            }
+            inside && /^!/ {
+                exit
+            }
+            inside {
+                print
+            }
+        ' <<< "$config"
+    )"
+    grep -Eq "set filter-map in ${FIREWALL_MAP}([[:space:]]+[0-9]+)?([[:space:]]|$)" \
+        <<< "$wan_block" || return 1
 
     tunnel_block="$(
         awk -v interface_name="$TUNNEL_INTERFACE" '
@@ -512,23 +529,73 @@ firewall_router_ok() {
     ! contains "$tunnel_block" "set filter-map in $FIREWALL_MAP"
 }
 
+firewall_router_detail() {
+    local config="$1"
+    local -a missing=()
+
+    contains "$config" "filter-map ipv4 $FIREWALL_MAP" ||
+        missing+=("карта $FIREWALL_MAP")
+    grep -Eqi 'match tcp any (any eq|eq) (80|http)([[:space:]]|$)' \
+        <<< "$config" || missing+=("http")
+    grep -Eqi 'match tcp any (any eq|eq) (443|https)([[:space:]]|$)' \
+        <<< "$config" || missing+=("https")
+    grep -Eqi 'match (tcp|udp) any (any eq|eq) (53|dns|domain)([[:space:]]|$)' \
+        <<< "$config" || missing+=("dns")
+    grep -Eqi 'match udp any (any eq|eq) (123|ntp)([[:space:]]|$)' \
+        <<< "$config" || missing+=("ntp")
+    contains "$config" "match icmp any any" || missing+=("icmp")
+
+    if ! awk -v interface_name="$WAN_INTERFACE" -v map_name="$FIREWALL_MAP" '
+        $0 ~ "^interface[[:space:]]+" interface_name "[[:space:]]*$" {
+            inside = 1
+            next
+        }
+        inside && (/^interface[[:space:]]+/ || /^!/) {
+            exit
+        }
+        inside && $0 ~ "set filter-map in " map_name \
+            "([[:space:]]+[0-9]+)?([[:space:]]|$)" {
+            found = 1
+        }
+        END {
+            exit(found ? 0 : 1)
+        }
+    ' <<< "$config"; then
+        missing+=("назначение на $WAN_INTERFACE")
+    fi
+
+    if ((${#missing[@]} == 0)); then
+        printf 'соответствует'
+    else
+        local IFS=', '
+        printf 'нет: %s' "${missing[*]}"
+    fi
+}
+
 check_4_firewall() {
     local title="Межсетевой экран EcoRouter"
     local hq_config="$1"
     local br_config="$2"
     local hq_ok=no
     local br_ok=no
+    local hq_detail
+    local br_detail
 
     firewall_router_ok "$hq_config" && hq_ok=yes
     firewall_router_ok "$br_config" && br_ok=yes
+    hq_detail="$(firewall_router_detail "$hq_config")"
+    br_detail="$(firewall_router_detail "$br_config")"
 
     if [[ "$hq_ok$br_ok" == yesyes ]]; then
-        set_result 4 1 "$title" "Оба WAN-интерфейса защищены, обязательные протоколы разрешены"
+        set_result 4 1 "$title" \
+            "HQ-RTR и BR-RTR: WAN-фильтр разрешает http, https, dns, ntp и icmp; остальное блокируется политикой фильтра"
     elif [[ "$hq_ok" == yes || "$br_ok" == yes ]] ||
         { contains "$hq_config" "$FIREWALL_MAP" && contains "$br_config" "$FIREWALL_MAP"; }; then
-        set_result 4 0.5 "$title" "Фильтрация настроена, но одна из конфигураций неполна"
+        set_result 4 0.5 "$title" \
+            "HQ-RTR: $hq_detail; BR-RTR: $br_detail"
     else
-        set_result 4 0 "$title" "Межсетевой экран не обнаружен"
+        set_result 4 0 "$title" \
+            "HQ-RTR: $hq_detail; BR-RTR: $br_detail"
     fi
 }
 
@@ -730,101 +797,140 @@ done
     fi
 }
 
-check_11_fail2ban() {
-    local title="Fail2ban для SSH"
-    local output
-    local active=no
-    local port=no
-    local port_value=""
-    local retries=no
-    local findtime=no
-    local bantime=no
-
-    output="$(linux_remote "$HQ_SRV_IP" "
-systemctl is-active fail2ban 2>/dev/null || true
-fail2ban-client status sshd 2>/dev/null || true
-echo PORT:\$(fail2ban-client get sshd port 2>/dev/null)
-echo RETRY:\$(fail2ban-client get sshd maxretry 2>/dev/null)
-echo FIND:\$(fail2ban-client get sshd findtime 2>/dev/null)
-echo BAN:\$(fail2ban-client get sshd bantime 2>/dev/null)
-" 2>/dev/null)" || true
-
-    if contains "$output" "active" &&
-        grep -Eqi 'Status for the jail:[[:space:]]*sshd|Jail list:.*(^|[[:space:],])sshd([[:space:],]|$)' \
-            <<< "$output"; then
-        active=yes
-    fi
-    port_value="$(sed -n 's/^PORT:[[:space:]]*//p' <<< "$output" | head -n 1)"
-    tr ', ' '\n\n' <<< "$port_value" |
-        grep -Fxq "$FAIL2BAN_SSH_PORT" && port=yes
-    contains "$output" "RETRY:$FAIL2BAN_MAX_RETRY" && retries=yes
-    contains "$output" "FIND:$FAIL2BAN_FIND_TIME" && findtime=yes
-    contains "$output" "BAN:$FAIL2BAN_BAN_TIME" && bantime=yes
-
-    if [[ "$active$port$retries$findtime$bantime" == yesyesyesyesyes ]]; then
-        set_result 11 1 "$title" \
-            "Jail sshd активна: порт $FAIL2BAN_SSH_PORT, попыток $FAIL2BAN_MAX_RETRY, бан ${FAIL2BAN_BAN_TIME}с"
-    elif [[ "$active" == yes ]] &&
-        { [[ "$port" == yes ]] || [[ "$retries" == yes ]] || [[ "$bantime" == yes ]]; }; then
-        set_result 11 0.5 "$title" \
-            "Fail2ban активен, но параметры jail отличаются от задания"
-    else
-        set_result 11 0 "$title" "Рабочая jail sshd не обнаружена"
-    fi
-}
-
 print_results() {
     local number
     local score
-    local color
     local total
+    local title
+    local detail
+    local title_line
+    local detail_line
+    local -a title_lines
+    local -a detail_lines
+    local line_count
+    local line_index
+    local table_file="$TMP_DIR/results.tsv"
+    local python_bin=""
+
+    wrap_text() {
+        local text="$1"
+        local width="$2"
+
+        printf '%s\n' "$text" | fold -s -w "$width"
+    }
 
     printf '\n%sРезультаты проверки module_3%s\n\n' "$C_BOLD" "$C_RESET"
-    printf '%-3s %-7s %-43s %s\n' "№" "Баллы" "Критерий" "Результат"
-    printf '%-3s %-7s %-43s %s\n' "---" "-------" "-------------------------------------------" "------------------------------"
+    printf '№\tБалл\tКритерий\tРезультат\n' > "$table_file"
 
-    for number in 1 2 3 4 5 6 7 8 9; do
-        score="${RESULT_SCORE[$number]:-0}"
-        case "$score" in
-            1) color="$C_GREEN" ;;
-            0.5) color="$C_YELLOW" ;;
-            *) color="$C_RED" ;;
+    for number in $(seq 1 13); do
+        case "$number" in
+            10)
+                score=N/A
+                title="Резервное копирование EcoRouter"
+                detail="Отсутствует в текущем задании"
+                ;;
+            11)
+                score=N/A
+                title="Fail2ban для SSH"
+                detail="Проверяется вручную"
+                ;;
+            12)
+                score=N/A
+                title="Кибер-бекап"
+                detail="Проверяется вручную"
+                ;;
+            13)
+                score=N/A
+                title="Отчёт по ГОСТ"
+                detail="Проверяется вручную"
+                ;;
+            *)
+                score="${RESULT_SCORE[$number]:-0}"
+                title="${RESULT_TITLE[$number]:-Не проверено}"
+                detail="${RESULT_DETAIL[$number]:-Нет результата}"
+                ;;
         esac
-        printf '%-3s %s%-7s%s %-43s %s\n' \
-            "$number" "$color" "$score" "$C_RESET" \
-            "${RESULT_TITLE[$number]:-Не проверено}" \
-            "${RESULT_DETAIL[$number]:-Нет результата}"
+
+        mapfile -t title_lines < <(wrap_text "$title" 40)
+        mapfile -t detail_lines < <(wrap_text "$detail" 85)
+        line_count="${#title_lines[@]}"
+        ((${#detail_lines[@]} > line_count)) &&
+            line_count="${#detail_lines[@]}"
+
+        for ((line_index = 0; line_index < line_count; line_index++)); do
+            title_line="${title_lines[$line_index]:-}"
+            detail_line="${detail_lines[$line_index]:-}"
+            if ((line_index == 0)); then
+                printf '%s\t%s\t%s\t%s\n' \
+                    "$number" "$score" "$title_line" "$detail_line" \
+                    >> "$table_file"
+            else
+                printf '\t\t%s\t%s\n' "$title_line" "$detail_line" \
+                    >> "$table_file"
+            fi
+        done
     done
 
-    printf '%-3s %-7s %-43s %s\n' \
-        10 "N/A" "Резервное копирование EcoRouter" "Отсутствует в текущем задании"
+    if command -v python3 >/dev/null 2>&1; then
+        python_bin=python3
+    elif command -v python >/dev/null 2>&1; then
+        python_bin=python
+    fi
 
-    score="${RESULT_SCORE[11]:-0}"
-    case "$score" in
-        1) color="$C_GREEN" ;;
-        0.5) color="$C_YELLOW" ;;
-        *) color="$C_RED" ;;
-    esac
-    printf '%-3s %s%-7s%s %-43s %s\n' \
-        11 "$color" "$score" "$C_RESET" \
-        "${RESULT_TITLE[11]:-Не проверено}" \
-        "${RESULT_DETAIL[11]:-Нет результата}"
+    if [[ -n "$python_bin" ]]; then
+        TABLE_FILE="$table_file" \
+            PYTHONUTF8=1 \
+            PYTHONIOENCODING=utf-8 \
+            TABLE_C_RESET="$C_RESET" \
+            TABLE_C_RED="$C_RED" \
+            TABLE_C_GREEN="$C_GREEN" \
+            TABLE_C_YELLOW="$C_YELLOW" \
+            "$python_bin" - <<'PY'
+import csv
+import os
 
-    printf '%-3s %-7s %-43s %s\n' \
-        12 "N/A" "Кибер-бекап" "Проверяется вручную"
-    printf '%-3s %-7s %-43s %s\n' \
-        13 "N/A" "Отчёт по ГОСТ" "Проверяется вручную"
+with open(os.environ["TABLE_FILE"], encoding="utf-8", newline="") as source:
+    rows = list(csv.reader(source, delimiter="\t"))
+
+widths = [
+    max(len(row[index]) for row in rows)
+    for index in range(len(rows[0]))
+]
+
+colors = {
+    "1": os.environ.get("TABLE_C_GREEN", ""),
+    "0.5": os.environ.get("TABLE_C_YELLOW", ""),
+    "0": os.environ.get("TABLE_C_RED", ""),
+}
+reset = os.environ.get("TABLE_C_RESET", "")
+
+for row_index, row in enumerate(rows):
+    cells = [
+        value.ljust(widths[index])
+        for index, value in enumerate(row)
+    ]
+    if row_index > 0 and row[1] in colors and colors[row[1]]:
+        cells[1] = f"{colors[row[1]]}{cells[1]}{reset}"
+    print(" | ".join(cells))
+    if row_index == 0:
+        print("-+-".join("-" * width for width in widths))
+PY
+    elif column --help 2>&1 | grep -q -- '--output-separator'; then
+        column -t -s $'\t' -o ' | ' "$table_file"
+    else
+        column -t -s $'\t' "$table_file"
+    fi
 
     total="$((TOTAL_HALF_POINTS / 2))"
     if ((TOTAL_HALF_POINTS % 2)); then
         total="${total}.5"
     fi
-    printf '\n%sИтого: %s / 10 баллов%s\n' "$C_BOLD" "$total" "$C_RESET"
+    printf '\n%sИтого: %s / 9 баллов%s\n' "$C_BOLD" "$total" "$C_RESET"
 }
 
 self_test() {
     local number
-    for number in 1 2 3 4 5 6 7 8 9 11; do
+    for number in 1 2 3 4 5 6 7 8 9; do
         case $((number % 3)) in
             0) set_result "$number" 0 "Тестовый критерий $number" "Ошибка" ;;
             1) set_result "$number" 1 "Тестовый критерий $number" "Соответствует" ;;
@@ -850,9 +956,9 @@ main() {
     install_dependencies || warn "Некоторые проверки могут быть недоступны"
     create_router_expect
 
-    log "1/10 Domain user import"
+    log "1/9 Domain user import"
     check_1_users
-    log "2/10 PKI and HTTPS"
+    log "2/9 PKI and HTTPS"
     check_2_pki
 
     log "Reading EcoRouter configurations and IPsec state"
@@ -861,22 +967,20 @@ main() {
     hq_sa="$(router_command "$HQ_RTR_SSH_HOST" "show crypto-ipsec ike security-associations" || true)"
     br_sa="$(router_command "$BR_RTR_SSH_HOST" "show crypto-ipsec ike security-associations" || true)"
 
-    log "3/10 Encrypted tunnel"
+    log "3/9 Encrypted tunnel"
     check_3_ipsec "$hq_router_config" "$br_router_config" "$hq_sa" "$br_sa"
-    log "4/10 Firewall"
+    log "4/9 Firewall"
     check_4_firewall "$hq_router_config" "$br_router_config"
-    log "5/10 CUPS"
+    log "5/9 CUPS"
     check_5_cups
-    log "6/10 Rsyslog"
+    log "6/9 Rsyslog"
     check_6_rsyslog "$hq_router_config" "$br_router_config"
-    log "7/10 Log rotation"
+    log "7/9 Log rotation"
     check_7_logrotate
-    log "8/10 Monitoring"
+    log "8/9 Monitoring"
     check_8_monitoring
-    log "9/10 Ansible inventory"
+    log "9/9 Ansible inventory"
     check_9_inventory
-    log "10/10 Fail2ban"
-    check_11_fail2ban
 
     print_results
 }
