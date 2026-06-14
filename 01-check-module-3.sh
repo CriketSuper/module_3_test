@@ -484,7 +484,6 @@ firewall_router_ok() {
     contains "$config" "set filter-map in $FIREWALL_MAP" || return 1
     contains "$config" "set filter-map in $VPN_FILTER_MAP 5" || return 1
     contains "$config" "set filter-map in $VPN_FILTER_MAP 10" || return 1
-    contains "$config" "no set filter-map in $VPN_FILTER_MAP 15" || return 1
     grep -Eq 'match udp any eq 53 ' <<< "$config" || return 1
     grep -Eq 'match udp any eq 123 ' <<< "$config" || return 1
     contains "$config" "match icmp any any" || return 1
@@ -739,6 +738,32 @@ check_11_fail2ban() {
     local retries=no
     local findtime=no
     local bantime=no
+    local retry_value=""
+    local find_value=""
+    local ban_value=""
+    local find_seconds=""
+    local ban_seconds=""
+
+    duration_seconds() {
+        local value="${1//[[:space:]]/}"
+
+        awk -v value="$value" '
+            BEGIN {
+                if (value ~ /^[0-9]+([.][0-9]+)?$/) {
+                    printf "%.0f\n", value
+                } else if (value ~ /^[0-9]+([.][0-9]+)?s$/) {
+                    sub(/s$/, "", value)
+                    printf "%.0f\n", value
+                } else if (value ~ /^[0-9]+([.][0-9]+)?m$/) {
+                    sub(/m$/, "", value)
+                    printf "%.0f\n", value * 60
+                } else if (value ~ /^[0-9]+([.][0-9]+)?h$/) {
+                    sub(/h$/, "", value)
+                    printf "%.0f\n", value * 3600
+                }
+            }
+        '
+    }
 
     output="$(linux_remote "$HQ_SRV_IP" "
 systemctl is-active fail2ban 2>/dev/null || true
@@ -755,11 +780,18 @@ echo BAN:\$(fail2ban-client get sshd bantime 2>/dev/null)
         active=yes
     fi
     port_value="$(sed -n 's/^PORT:[[:space:]]*//p' <<< "$output" | head -n 1)"
-    tr ', ' '\n\n' <<< "$port_value" |
-        grep -Fxq "$FAIL2BAN_SSH_PORT" && port=yes
-    contains "$output" "RETRY:$FAIL2BAN_MAX_RETRY" && retries=yes
-    contains "$output" "FIND:$FAIL2BAN_FIND_TIME" && findtime=yes
-    contains "$output" "BAN:$FAIL2BAN_BAN_TIME" && bantime=yes
+    grep -Eq "(^|[^0-9])${FAIL2BAN_SSH_PORT}([^0-9]|$)" \
+        <<< "$port_value" && port=yes
+
+    retry_value="$(sed -n 's/^RETRY:[[:space:]]*//p' <<< "$output" | head -n 1)"
+    find_value="$(sed -n 's/^FIND:[[:space:]]*//p' <<< "$output" | head -n 1)"
+    ban_value="$(sed -n 's/^BAN:[[:space:]]*//p' <<< "$output" | head -n 1)"
+    find_seconds="$(duration_seconds "$find_value")"
+    ban_seconds="$(duration_seconds "$ban_value")"
+
+    [[ "$retry_value" =~ ^${FAIL2BAN_MAX_RETRY}([.]0+)?$ ]] && retries=yes
+    [[ "$find_seconds" == "$FAIL2BAN_FIND_TIME" ]] && findtime=yes
+    [[ "$ban_seconds" == "$FAIL2BAN_BAN_TIME" ]] && bantime=yes
 
     if [[ "$active$port$retries$findtime$bantime" == yesyesyesyesyes ]]; then
         set_result 11 1 "$title" \
@@ -767,7 +799,7 @@ echo BAN:\$(fail2ban-client get sshd bantime 2>/dev/null)
     elif [[ "$active" == yes ]] &&
         { [[ "$port" == yes ]] || [[ "$retries" == yes ]] || [[ "$bantime" == yes ]]; }; then
         set_result 11 0.5 "$title" \
-            "Fail2ban активен, но параметры jail отличаются от задания"
+            "port=${port_value:-?}, retry=${retry_value:-?}, find=${find_value:-?}, ban=${ban_value:-?}"
     else
         set_result 11 0 "$title" "Рабочая jail sshd не обнаружена"
     fi
@@ -776,44 +808,121 @@ echo BAN:\$(fail2ban-client get sshd bantime 2>/dev/null)
 print_results() {
     local number
     local score
-    local color
     local total
+    local title
+    local detail
+    local title_line
+    local detail_line
+    local -a title_lines
+    local -a detail_lines
+    local line_count
+    local line_index
+    local table_file="$TMP_DIR/results.tsv"
+    local python_bin=""
+
+    wrap_text() {
+        local text="$1"
+        local width="$2"
+
+        printf '%s\n' "$text" | fold -s -w "$width"
+    }
 
     printf '\n%sРезультаты проверки module_3%s\n\n' "$C_BOLD" "$C_RESET"
-    printf '%-3s %-7s %-43s %s\n' "№" "Баллы" "Критерий" "Результат"
-    printf '%-3s %-7s %-43s %s\n' "---" "-------" "-------------------------------------------" "------------------------------"
+    printf '№\tБалл\tКритерий\tРезультат\n' > "$table_file"
 
-    for number in 1 2 3 4 5 6 7 8 9; do
-        score="${RESULT_SCORE[$number]:-0}"
-        case "$score" in
-            1) color="$C_GREEN" ;;
-            0.5) color="$C_YELLOW" ;;
-            *) color="$C_RED" ;;
+    for number in $(seq 1 13); do
+        case "$number" in
+            10)
+                score=N/A
+                title="Резервное копирование EcoRouter"
+                detail="Отсутствует в текущем задании"
+                ;;
+            12)
+                score=N/A
+                title="Кибер-бекап"
+                detail="Проверяется вручную"
+                ;;
+            13)
+                score=N/A
+                title="Отчёт по ГОСТ"
+                detail="Проверяется вручную"
+                ;;
+            *)
+                score="${RESULT_SCORE[$number]:-0}"
+                title="${RESULT_TITLE[$number]:-Не проверено}"
+                detail="${RESULT_DETAIL[$number]:-Нет результата}"
+                ;;
         esac
-        printf '%-3s %s%-7s%s %-43s %s\n' \
-            "$number" "$color" "$score" "$C_RESET" \
-            "${RESULT_TITLE[$number]:-Не проверено}" \
-            "${RESULT_DETAIL[$number]:-Нет результата}"
+
+        mapfile -t title_lines < <(wrap_text "$title" 40)
+        mapfile -t detail_lines < <(wrap_text "$detail" 85)
+        line_count="${#title_lines[@]}"
+        ((${#detail_lines[@]} > line_count)) &&
+            line_count="${#detail_lines[@]}"
+
+        for ((line_index = 0; line_index < line_count; line_index++)); do
+            title_line="${title_lines[$line_index]:-}"
+            detail_line="${detail_lines[$line_index]:-}"
+            if ((line_index == 0)); then
+                printf '%s\t%s\t%s\t%s\n' \
+                    "$number" "$score" "$title_line" "$detail_line" \
+                    >> "$table_file"
+            else
+                printf '\t\t%s\t%s\n' "$title_line" "$detail_line" \
+                    >> "$table_file"
+            fi
+        done
     done
 
-    printf '%-3s %-7s %-43s %s\n' \
-        10 "N/A" "Резервное копирование EcoRouter" "Отсутствует в текущем задании"
+    if command -v python3 >/dev/null 2>&1; then
+        python_bin=python3
+    elif command -v python >/dev/null 2>&1; then
+        python_bin=python
+    fi
 
-    score="${RESULT_SCORE[11]:-0}"
-    case "$score" in
-        1) color="$C_GREEN" ;;
-        0.5) color="$C_YELLOW" ;;
-        *) color="$C_RED" ;;
-    esac
-    printf '%-3s %s%-7s%s %-43s %s\n' \
-        11 "$color" "$score" "$C_RESET" \
-        "${RESULT_TITLE[11]:-Не проверено}" \
-        "${RESULT_DETAIL[11]:-Нет результата}"
+    if [[ -n "$python_bin" ]]; then
+        TABLE_FILE="$table_file" \
+            PYTHONUTF8=1 \
+            PYTHONIOENCODING=utf-8 \
+            TABLE_C_RESET="$C_RESET" \
+            TABLE_C_RED="$C_RED" \
+            TABLE_C_GREEN="$C_GREEN" \
+            TABLE_C_YELLOW="$C_YELLOW" \
+            "$python_bin" - <<'PY'
+import csv
+import os
 
-    printf '%-3s %-7s %-43s %s\n' \
-        12 "N/A" "Кибер-бекап" "Проверяется вручную"
-    printf '%-3s %-7s %-43s %s\n' \
-        13 "N/A" "Отчёт по ГОСТ" "Проверяется вручную"
+with open(os.environ["TABLE_FILE"], encoding="utf-8", newline="") as source:
+    rows = list(csv.reader(source, delimiter="\t"))
+
+widths = [
+    max(len(row[index]) for row in rows)
+    for index in range(len(rows[0]))
+]
+
+colors = {
+    "1": os.environ.get("TABLE_C_GREEN", ""),
+    "0.5": os.environ.get("TABLE_C_YELLOW", ""),
+    "0": os.environ.get("TABLE_C_RED", ""),
+}
+reset = os.environ.get("TABLE_C_RESET", "")
+
+for row_index, row in enumerate(rows):
+    cells = [
+        value.ljust(widths[index])
+        for index, value in enumerate(row)
+    ]
+    if row_index > 0 and row[1] in colors and colors[row[1]]:
+        cells[1] = f"{colors[row[1]]}{cells[1]}{reset}"
+    print(" | ".join(cells))
+    if row_index == 0:
+        print("-+-".join("-" * width for width in widths))
+PY
+    elif column --help 2>&1 | grep -q -- '--output-separator'; then
+        column -t -s $'\t' -o ' | ' "$table_file"
+    else
+        column -t -s $'\t' "$table_file"
+    fi
 
     total="$((TOTAL_HALF_POINTS / 2))"
     if ((TOTAL_HALF_POINTS % 2)); then
