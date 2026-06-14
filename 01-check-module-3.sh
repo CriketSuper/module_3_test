@@ -25,8 +25,7 @@ required_variables=(
     MON_DOMAIN GRAFANA_PORT PROMETHEUS_PORT NODE_EXPORTER_PORT
     GRAFANA_ADMIN_USER GRAFANA_ADMIN_PASSWORD ANSIBLE_DIR
     INVENTORY_PLAYBOOK INVENTORY_REPORT_DIR HQ_CLI_IP
-    FAIL2BAN_SSH_PORT FAIL2BAN_MAX_RETRY FAIL2BAN_FIND_TIME
-    FAIL2BAN_BAN_TIME AUTO_INSTALL
+    AUTO_INSTALL
 )
 
 for variable_name in "${required_variables[@]}"; do
@@ -480,13 +479,13 @@ firewall_router_ok() {
     local tunnel_block
 
     contains "$config" "filter-map ipv4 $FIREWALL_MAP" || return 1
-    grep -Eq 'match tcp any (any eq|eq) 80([[:space:]]|$)' \
+    grep -Eqi 'match tcp any (any eq|eq) (80|http)([[:space:]]|$)' \
         <<< "$config" || return 1
-    grep -Eq 'match tcp any (any eq|eq) 443([[:space:]]|$)' \
+    grep -Eqi 'match tcp any (any eq|eq) (443|https)([[:space:]]|$)' \
         <<< "$config" || return 1
-    grep -Eq 'match (tcp|udp) any (any eq|eq) 53([[:space:]]|$)' \
+    grep -Eqi 'match (tcp|udp) any (any eq|eq) (53|dns|domain)([[:space:]]|$)' \
         <<< "$config" || return 1
-    grep -Eq 'match udp any (any eq|eq) 123([[:space:]]|$)' \
+    grep -Eqi 'match udp any (any eq|eq) (123|ntp)([[:space:]]|$)' \
         <<< "$config" || return 1
     contains "$config" "match icmp any any" || return 1
 
@@ -536,13 +535,13 @@ firewall_router_detail() {
 
     contains "$config" "filter-map ipv4 $FIREWALL_MAP" ||
         missing+=("карта $FIREWALL_MAP")
-    grep -Eq 'match tcp any (any eq|eq) 80([[:space:]]|$)' \
+    grep -Eqi 'match tcp any (any eq|eq) (80|http)([[:space:]]|$)' \
         <<< "$config" || missing+=("http")
-    grep -Eq 'match tcp any (any eq|eq) 443([[:space:]]|$)' \
+    grep -Eqi 'match tcp any (any eq|eq) (443|https)([[:space:]]|$)' \
         <<< "$config" || missing+=("https")
-    grep -Eq 'match (tcp|udp) any (any eq|eq) 53([[:space:]]|$)' \
+    grep -Eqi 'match (tcp|udp) any (any eq|eq) (53|dns|domain)([[:space:]]|$)' \
         <<< "$config" || missing+=("dns")
-    grep -Eq 'match udp any (any eq|eq) 123([[:space:]]|$)' \
+    grep -Eqi 'match udp any (any eq|eq) (123|ntp)([[:space:]]|$)' \
         <<< "$config" || missing+=("ntp")
     contains "$config" "match icmp any any" || missing+=("icmp")
 
@@ -798,112 +797,6 @@ done
     fi
 }
 
-check_11_fail2ban() {
-    local title="Fail2ban для SSH"
-    local output
-    local active=no
-    local port=no
-    local port_value=""
-    local retries=no
-    local findtime=no
-    local bantime=no
-    local retry_value=""
-    local find_value=""
-    local ban_value=""
-    local find_seconds=""
-    local ban_seconds=""
-
-    duration_seconds() {
-        local value="${1//[[:space:]]/}"
-
-        awk -v value="$value" '
-            BEGIN {
-                if (value ~ /^[0-9]+([.][0-9]+)?$/) {
-                    printf "%.0f\n", value
-                } else if (value ~ /^[0-9]+([.][0-9]+)?s$/) {
-                    sub(/s$/, "", value)
-                    printf "%.0f\n", value
-                } else if (value ~ /^[0-9]+([.][0-9]+)?m$/) {
-                    sub(/m$/, "", value)
-                    printf "%.0f\n", value * 60
-                } else if (value ~ /^[0-9]+([.][0-9]+)?h$/) {
-                    sub(/h$/, "", value)
-                    printf "%.0f\n", value * 3600
-                }
-            }
-        '
-    }
-
-    output="$(linux_remote "$HQ_SRV_IP" "
-systemctl is-active fail2ban 2>/dev/null || true
-fail2ban-client status sshd 2>/dev/null || true
-config=/etc/fail2ban/jail.d/sshd.local
-read_config_value() {
-    local key=\$1
-    awk -F= -v key=\"\$key\" '
-        /^[[:space:]]*\\[/ {
-            section = \$0
-            gsub(/^[[:space:]]*\\[|\\][[:space:]]*$/, \"\", section)
-            next
-        }
-        (section == \"DEFAULT\" || section == \"sshd\") {
-            name = \$1
-            gsub(/[[:space:]]/, \"\", name)
-            if (name == key) {
-                value = \$2
-                sub(/^[[:space:]]+/, \"\", value)
-                sub(/[[:space:]]+$/, \"\", value)
-                found = value
-            }
-        }
-        END {
-            print found
-        }
-    ' \"\$config\" 2>/dev/null
-}
-port=\$(fail2ban-client get sshd port 2>/dev/null || true)
-retry=\$(fail2ban-client get sshd maxretry 2>/dev/null || true)
-find=\$(fail2ban-client get sshd findtime 2>/dev/null || true)
-ban=\$(fail2ban-client get sshd bantime 2>/dev/null || true)
-[[ -n \"\$port\" ]] || port=\$(read_config_value port)
-[[ -n \"\$retry\" ]] || retry=\$(read_config_value maxretry)
-[[ -n \"\$find\" ]] || find=\$(read_config_value findtime)
-[[ -n \"\$ban\" ]] || ban=\$(read_config_value bantime)
-printf 'PORT:%s\nRETRY:%s\nFIND:%s\nBAN:%s\n' \
-    \"\$port\" \"\$retry\" \"\$find\" \"\$ban\"
-" 2>/dev/null)" || true
-
-    if contains "$output" "active" &&
-        grep -Eqi 'Status for the jail:[[:space:]]*sshd|Jail list:.*(^|[[:space:],])sshd([[:space:],]|$)' \
-            <<< "$output"; then
-        active=yes
-    fi
-    port_value="$(sed -n 's/^PORT:[[:space:]]*//p' <<< "$output" | head -n 1)"
-    grep -Eq "(^|[^0-9])${FAIL2BAN_SSH_PORT}([^0-9]|$)" \
-        <<< "$port_value" && port=yes
-
-    retry_value="$(sed -n 's/^RETRY:[[:space:]]*//p' <<< "$output" | head -n 1)"
-    find_value="$(sed -n 's/^FIND:[[:space:]]*//p' <<< "$output" | head -n 1)"
-    ban_value="$(sed -n 's/^BAN:[[:space:]]*//p' <<< "$output" | head -n 1)"
-    find_seconds="$(duration_seconds "$find_value")"
-    ban_seconds="$(duration_seconds "$ban_value")"
-
-    [[ "$retry_value" =~ ^${FAIL2BAN_MAX_RETRY}([.]0+)?$ ]] && retries=yes
-    [[ "$find_seconds" == "$FAIL2BAN_FIND_TIME" ]] && findtime=yes
-    [[ "$ban_seconds" == "$FAIL2BAN_BAN_TIME" ]] && bantime=yes
-
-    if [[ "$active$port$retries$findtime$bantime" == yesyesyesyesyes ]]; then
-        set_result 11 1 "$title" \
-            "Jail sshd активна: порт $FAIL2BAN_SSH_PORT, попыток $FAIL2BAN_MAX_RETRY, бан ${FAIL2BAN_BAN_TIME}с"
-    elif [[ "$active" == yes ]] &&
-        { [[ "$port" == yes ]] || [[ "$retries" == yes ]] || [[ "$bantime" == yes ]]; }; then
-        set_result 11 0.5 "$title" \
-            "port=${port_value:-?}, retry=${retry_value:-?}, find=${find_value:-?}, ban=${ban_value:-?}"
-    else
-        set_result 11 0 "$title" "Рабочая jail sshd не обнаружена"
-    fi
-}
-
 print_results() {
     local number
     local score
@@ -935,6 +828,11 @@ print_results() {
                 score=N/A
                 title="Резервное копирование EcoRouter"
                 detail="Отсутствует в текущем задании"
+                ;;
+            11)
+                score=N/A
+                title="Fail2ban для SSH"
+                detail="Проверяется вручную"
                 ;;
             12)
                 score=N/A
@@ -1027,12 +925,12 @@ PY
     if ((TOTAL_HALF_POINTS % 2)); then
         total="${total}.5"
     fi
-    printf '\n%sИтого: %s / 10 баллов%s\n' "$C_BOLD" "$total" "$C_RESET"
+    printf '\n%sИтого: %s / 9 баллов%s\n' "$C_BOLD" "$total" "$C_RESET"
 }
 
 self_test() {
     local number
-    for number in 1 2 3 4 5 6 7 8 9 11; do
+    for number in 1 2 3 4 5 6 7 8 9; do
         case $((number % 3)) in
             0) set_result "$number" 0 "Тестовый критерий $number" "Ошибка" ;;
             1) set_result "$number" 1 "Тестовый критерий $number" "Соответствует" ;;
@@ -1058,9 +956,9 @@ main() {
     install_dependencies || warn "Некоторые проверки могут быть недоступны"
     create_router_expect
 
-    log "1/10 Domain user import"
+    log "1/9 Domain user import"
     check_1_users
-    log "2/10 PKI and HTTPS"
+    log "2/9 PKI and HTTPS"
     check_2_pki
 
     log "Reading EcoRouter configurations and IPsec state"
@@ -1069,22 +967,20 @@ main() {
     hq_sa="$(router_command "$HQ_RTR_SSH_HOST" "show crypto-ipsec ike security-associations" || true)"
     br_sa="$(router_command "$BR_RTR_SSH_HOST" "show crypto-ipsec ike security-associations" || true)"
 
-    log "3/10 Encrypted tunnel"
+    log "3/9 Encrypted tunnel"
     check_3_ipsec "$hq_router_config" "$br_router_config" "$hq_sa" "$br_sa"
-    log "4/10 Firewall"
+    log "4/9 Firewall"
     check_4_firewall "$hq_router_config" "$br_router_config"
-    log "5/10 CUPS"
+    log "5/9 CUPS"
     check_5_cups
-    log "6/10 Rsyslog"
+    log "6/9 Rsyslog"
     check_6_rsyslog "$hq_router_config" "$br_router_config"
-    log "7/10 Log rotation"
+    log "7/9 Log rotation"
     check_7_logrotate
-    log "8/10 Monitoring"
+    log "8/9 Monitoring"
     check_8_monitoring
-    log "9/10 Ansible inventory"
+    log "9/9 Ansible inventory"
     check_9_inventory
-    log "10/10 Fail2ban"
-    check_11_fail2ban
 
     print_results
 }
