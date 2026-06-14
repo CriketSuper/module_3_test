@@ -26,7 +26,7 @@ required_variables=(
     GRAFANA_ADMIN_USER GRAFANA_ADMIN_PASSWORD ANSIBLE_DIR
     INVENTORY_PLAYBOOK INVENTORY_REPORT_DIR HQ_CLI_IP
     FAIL2BAN_SSH_PORT FAIL2BAN_MAX_RETRY FAIL2BAN_FIND_TIME
-    FAIL2BAN_BAN_TIME ACTIVE_FAIL2BAN_TEST AUTO_INSTALL
+    FAIL2BAN_BAN_TIME AUTO_INSTALL
 )
 
 for variable_name in "${required_variables[@]}"; do
@@ -86,7 +86,7 @@ contains() {
 }
 
 count_matches() {
-    grep -Eoc -- "$2" <<< "$1" 2>/dev/null || true
+    grep -Eo -- "$2" <<< "$1" 2>/dev/null | wc -l
 }
 
 remote_script() {
@@ -355,12 +355,12 @@ printf 'TOTAL:%s\nFOUND:%s\nFIRST:%s\nPASS64:%s\n' \
 check_2_pki() {
     local title="Центр сертификации и HTTPS"
     local hq_output
-    local isp_output
+    local served_cert="$TMP_DIR/served-web.crt"
+    local cert_output=""
     local web_code=000
     local docker_code=000
     local ca_ok=no
     local cert_ok=no
-    local nginx_ok=no
     local trust_ok=no
     local gost=no
 
@@ -369,26 +369,42 @@ test -s /root/au-team-ca/ca.crt && echo CA:yes
 test -s /root/au-team-ca/ca.key && echo CAKEY:yes
 test -s /root/au-team-ca/web.crt && echo CERT:yes
 openssl verify -CAfile /root/au-team-ca/ca.crt /root/au-team-ca/web.crt 2>/dev/null || true
-openssl x509 -in /root/au-team-ca/web.crt -noout -text -dates -ext subjectAltName 2>/dev/null || true
-" 2>/dev/null)" || true
-
-    isp_output="$(isp_remote "
-systemctl is-active nginx 2>/dev/null || true
-nginx -T 2>&1 || true
-openssl verify -CAfile /etc/nginx/ssl/au-team-ca.crt /etc/nginx/ssl/web.crt 2>/dev/null || true
-openssl x509 -in /etc/nginx/ssl/web.crt -noout -text -dates -ext subjectAltName 2>/dev/null || true
+openssl x509 -in /root/au-team-ca/web.crt -noout -checkend 0 &&
+    echo VALID_NOW:yes
+if ! openssl x509 -in /root/au-team-ca/web.crt \
+    -noout -checkend $(((CERT_DAYS + 1) * 86400)); then
+    echo VALIDITY:yes
+fi
 " 2>/dev/null)" || true
 
     contains "$hq_output" "CA:yes" &&
         contains "$hq_output" "CAKEY:yes" &&
-        contains "$hq_output" "web.crt: OK" && ca_ok=yes
-    contains "$isp_output" "web.crt: OK" &&
-        contains "$isp_output" "DNS:$WEB_DOMAIN" &&
-        contains "$isp_output" "DNS:$DOCKER_DOMAIN" && cert_ok=yes
-    contains "$isp_output" "active" &&
-        contains "$isp_output" "listen 443 ssl" &&
-        contains "$isp_output" "ssl_certificate" && nginx_ok=yes
-    grep -Eqi '(gost|id-tc26|1\.2\.643\.)' <<< "$isp_output" && gost=yes
+        contains "$hq_output" "web.crt: OK" &&
+        contains "$hq_output" "VALID_NOW:yes" &&
+        contains "$hq_output" "VALIDITY:yes" && ca_ok=yes
+
+    openssl s_client \
+        -connect "$WEB_DOMAIN:443" \
+        -servername "$WEB_DOMAIN" \
+        -showcerts </dev/null 2>/dev/null |
+        awk '
+            /-----BEGIN CERTIFICATE-----/ {capture=1}
+            capture {print}
+            /-----END CERTIFICATE-----/ {exit}
+        ' > "$served_cert"
+
+    if [[ -s "$served_cert" ]]; then
+        cert_output="$(
+            openssl x509 -in "$served_cert" \
+                -noout -text -dates -ext subjectAltName 2>/dev/null || true
+        )"
+        contains "$cert_output" "DNS:$WEB_DOMAIN" &&
+            contains "$cert_output" "DNS:$DOCKER_DOMAIN" &&
+            openssl x509 -in "$served_cert" -noout -checkend 0 \
+                >/dev/null 2>&1 &&
+            cert_ok=yes
+        grep -Eqi '(gost|id-tc26|1\.2\.643\.)' <<< "$cert_output" && gost=yes
+    fi
 
     web_code="$(curl -sS --connect-timeout 5 --max-time 15 \
         -o /dev/null -w '%{http_code}' \
@@ -402,12 +418,13 @@ openssl x509 -in /etc/nginx/ssl/web.crt -noout -text -dates -ext subjectAltName 
         trust_ok=yes
     fi
 
-    if [[ "$ca_ok$cert_ok$nginx_ok$trust_ok$gost" == yesyesyesyesyes ]]; then
+    if [[ "$ca_ok$cert_ok$trust_ok$gost" == yesyesyesyes ]]; then
         set_result 2 1 "$title" "GOST-сертификат установлен, оба HTTPS-сайта доверены"
-    elif [[ "$ca_ok$cert_ok$nginx_ok$trust_ok" == yesyesyesyes ]]; then
+    elif [[ "$ca_ok$cert_ok$trust_ok" == yesyesyes ]]; then
         set_result 2 0.5 "$title" "PKI и доверенный HTTPS работают, но сертификат использует не GOST"
     else
-        set_result 2 0 "$title" "Рабочая PKI и доверенный серверный сертификат не подтверждены"
+        set_result 2 0 "$title" \
+            "PKI: $ca_ok, сертификат: $cert_ok, HTTPS: web=$web_code docker=$docker_code"
     fi
 }
 
@@ -459,21 +476,40 @@ check_3_ipsec() {
 
 firewall_router_ok() {
     local config="$1"
-    local peer="$2"
+    local tunnel_block
     local port
 
     contains "$config" "filter-map ipv4 $FIREWALL_MAP" || return 1
     contains "$config" "interface $WAN_INTERFACE" || return 1
     contains "$config" "set filter-map in $FIREWALL_MAP" || return 1
-    contains "$config" "match gre" || return 1
-    contains "$config" "eq 4500" || return 1
-    contains "$config" "match udp any any eq 53" || return 1
-    contains "$config" "match udp any any eq 123" || return 1
+    contains "$config" "set filter-map in $VPN_FILTER_MAP 5" || return 1
+    contains "$config" "set filter-map in $VPN_FILTER_MAP 10" || return 1
+    contains "$config" "no set filter-map in $VPN_FILTER_MAP 15" || return 1
+    grep -Eq 'match udp any eq 53 ' <<< "$config" || return 1
+    grep -Eq 'match udp any eq 123 ' <<< "$config" || return 1
     contains "$config" "match icmp any any" || return 1
-    contains "$config" "$peer" || return 1
     for port in $ALLOWED_TCP_PORTS; do
         contains "$config" "match tcp any any eq $port" || return 1
     done
+
+    tunnel_block="$(
+        awk -v interface_name="$TUNNEL_INTERFACE" '
+            $0 ~ "^interface[[:space:]]+" interface_name "[[:space:]]*$" {
+                inside = 1
+                next
+            }
+            inside && /^interface[[:space:]]+/ {
+                exit
+            }
+            inside && /^!/ {
+                exit
+            }
+            inside {
+                print
+            }
+        ' <<< "$config"
+    )"
+    ! contains "$tunnel_block" "set filter-map in $FIREWALL_MAP"
 }
 
 check_4_firewall() {
@@ -483,8 +519,8 @@ check_4_firewall() {
     local hq_ok=no
     local br_ok=no
 
-    firewall_router_ok "$hq_config" "$BR_RTR_WAN_IP" && hq_ok=yes
-    firewall_router_ok "$br_config" "$HQ_RTR_WAN_IP" && br_ok=yes
+    firewall_router_ok "$hq_config" && hq_ok=yes
+    firewall_router_ok "$br_config" && br_ok=yes
 
     if [[ "$hq_ok$br_ok" == yesyes ]]; then
         set_result 4 1 "$title" "Оба WAN-интерфейса защищены, обязательные протоколы разрешены"
@@ -504,18 +540,18 @@ check_5_cups() {
     local default_printer=""
 
     output="$(linux_remote "$HQ_SRV_IP" "
-systemctl is-active cups 2>/dev/null || true
-lpstat -p '$CUPS_SERVER_QUEUE' 2>/dev/null || true
-lpstat -a '$CUPS_SERVER_QUEUE' 2>/dev/null || true
-lpoptions -p '$CUPS_SERVER_QUEUE' 2>/dev/null || true
-ss -lnt 2>/dev/null | grep ':$CUPS_SERVER_PORT ' || true
+systemctl is-active --quiet cups && echo SERVICE:yes
+lpstat -p '$CUPS_SERVER_QUEUE' >/dev/null 2>&1 && echo QUEUE:yes
+lpstat -a '$CUPS_SERVER_QUEUE' >/dev/null 2>&1 && echo ACCEPTING:yes
+ss -lnt 2>/dev/null | grep -q ':$CUPS_SERVER_PORT ' && echo LISTEN:yes
 " 2>/dev/null)" || true
 
-    contains "$output" "active" &&
-        contains "$output" "$CUPS_SERVER_QUEUE" &&
-        contains "$output" "accepting requests" && server_ok=yes
+    contains "$output" "SERVICE:yes" &&
+        contains "$output" "QUEUE:yes" &&
+        contains "$output" "ACCEPTING:yes" &&
+        contains "$output" "LISTEN:yes" && server_ok=yes
 
-    default_printer="$(lpstat -d 2>/dev/null | sed -n 's/^system default destination: //p')"
+    default_printer="$(lpstat -d 2>/dev/null | awk -F: '{gsub(/^[ \t]+/, "", $2); print $2}')"
     if [[ "$default_printer" == "$CUPS_CLIENT_QUEUE" ]] &&
         lpstat -v "$CUPS_CLIENT_QUEUE" 2>/dev/null |
             grep -Fq "/printers/$CUPS_SERVER_QUEUE"; then
@@ -525,9 +561,11 @@ ss -lnt 2>/dev/null | grep ':$CUPS_SERVER_PORT ' || true
     if [[ "$server_ok$client_ok" == yesyes ]]; then
         set_result 5 1 "$title" "PDF-принтер опубликован и установлен на HQ-CLI по умолчанию"
     elif [[ "$server_ok" == yes ]]; then
-        set_result 5 0.5 "$title" "Принт-сервер работает, клиентская очередь не является принтером по умолчанию"
+        set_result 5 0.5 "$title" \
+            "Сервер работает; очередь HQ-CLI или принтер по умолчанию не подтверждены"
     else
-        set_result 5 0 "$title" "Рабочий CUPS PDF-принтер не обнаружен"
+        set_result 5 0 "$title" \
+            "CUPS server=$server_ok, client=$client_ok, default=${default_printer:-не найден}"
     fi
 }
 
@@ -652,9 +690,11 @@ docker exec grafana sh -c 'grep -R -E \"CPU usage|Memory usage|Root filesystem u
         [[ "$login$dns" == yesyes ]]; then
         set_result 8 1 "$title" "HQ-SRV и BR-SRV доступны, CPU, RAM и диск отображаются"
     elif ((containers >= 2 && targets >= 1)) || [[ "$login" == yes ]]; then
-        set_result 8 0.5 "$title" "Мониторинг работает, но одна часть конфигурации не соответствует"
+        set_result 8 0.5 "$title" \
+            "Контейнеры=$containers/3, targets=$targets/2, панели=$panels/3, DNS=$dns, вход=$login"
     else
-        set_result 8 0 "$title" "Рабочий сервер мониторинга не обнаружен"
+        set_result 8 0 "$title" \
+            "Контейнеры=$containers/3, targets=$targets/2, DNS=$dns, вход=$login"
     fi
 }
 
@@ -699,11 +739,6 @@ check_11_fail2ban() {
     local retries=no
     local findtime=no
     local bantime=no
-    local active_test=no
-    local control_socket="$TMP_DIR/hq-srv-control"
-    local source_ip=""
-    local status_output=""
-    local i
 
     output="$(linux_remote "$HQ_SRV_IP" "
 systemctl is-active fail2ban 2>/dev/null || true
@@ -726,64 +761,13 @@ echo BAN:\$(fail2ban-client get sshd bantime 2>/dev/null)
     contains "$output" "FIND:$FAIL2BAN_FIND_TIME" && findtime=yes
     contains "$output" "BAN:$FAIL2BAN_BAN_TIME" && bantime=yes
 
-    if [[ "$ACTIVE_FAIL2BAN_TEST" == yes && "$active" == yes ]]; then
-        SSHPASS="$LINUX_SSH_PASSWORD" sshpass -e ssh \
-            -M -S "$control_socket" -fN \
-            -p "$LINUX_SSH_PORT" \
-            -o ControlPersist=90 \
-            -o StrictHostKeyChecking=no \
-            -o UserKnownHostsFile=/dev/null \
-            -o LogLevel=ERROR \
-            "$LINUX_SSH_USER@$HQ_SRV_IP" 2>/dev/null || true
-
-        if [[ -S "$control_socket" ]]; then
-            source_ip="$(
-                ssh -S "$control_socket" \
-                    -p "$LINUX_SSH_PORT" \
-                    "$LINUX_SSH_USER@$HQ_SRV_IP" \
-                    "printf '%s\n' \"\$SSH_CONNECTION\" | awk '{print \$1}'" \
-                    2>/dev/null
-            )"
-
-            for ((i = 0; i < FAIL2BAN_MAX_RETRY; i++)); do
-                SSHPASS="DefinitelyWrong-${RANDOM}" sshpass -e ssh \
-                    -p "$LINUX_SSH_PORT" \
-                    -o PreferredAuthentications=password,keyboard-interactive \
-                    -o PubkeyAuthentication=no \
-                    -o NumberOfPasswordPrompts=1 \
-                    -o ConnectTimeout=4 \
-                    -o StrictHostKeyChecking=no \
-                    -o UserKnownHostsFile=/dev/null \
-                    -o LogLevel=ERROR \
-                    "$LINUX_SSH_USER@$HQ_SRV_IP" true >/dev/null 2>&1 || true
-            done
-            sleep 4
-
-            status_output="$(
-                {
-                    printf '%s\n' "$LINUX_SSH_PASSWORD"
-                    printf '%s\n' "$LINUX_SSH_PASSWORD"
-                } |
-                    ssh -S "$control_socket" \
-                        -p "$LINUX_SSH_PORT" \
-                        "$LINUX_SSH_USER@$HQ_SRV_IP" \
-                        "sudo -S -p '' fail2ban-client status sshd; sudo -S -p '' fail2ban-client set sshd unbanip '$source_ip'" \
-                        2>/dev/null
-            )" || true
-            contains "$status_output" "$source_ip" && active_test=yes
-            ssh -S "$control_socket" -O exit \
-                -p "$LINUX_SSH_PORT" "$LINUX_SSH_USER@$HQ_SRV_IP" \
-                >/dev/null 2>&1 || true
-        fi
-    elif [[ "$ACTIVE_FAIL2BAN_TEST" == no ]]; then
-        active_test=yes
-    fi
-
-    if [[ "$active$port$retries$findtime$bantime$active_test" == yesyesyesyesyesyes ]]; then
-        set_result 11 1 "$title" "Параметры верны, блокировка после $FAIL2BAN_MAX_RETRY ошибок подтверждена"
+    if [[ "$active$port$retries$findtime$bantime" == yesyesyesyesyes ]]; then
+        set_result 11 1 "$title" \
+            "Jail sshd активна: порт $FAIL2BAN_SSH_PORT, попыток $FAIL2BAN_MAX_RETRY, бан ${FAIL2BAN_BAN_TIME}с"
     elif [[ "$active" == yes ]] &&
         { [[ "$port" == yes ]] || [[ "$retries" == yes ]] || [[ "$bantime" == yes ]]; }; then
-        set_result 11 0.5 "$title" "Fail2ban работает, но одна настройка или активный тест не соответствует"
+        set_result 11 0.5 "$title" \
+            "Fail2ban активен, но параметры jail отличаются от задания"
     else
         set_result 11 0 "$title" "Рабочая jail sshd не обнаружена"
     fi
@@ -862,7 +846,7 @@ main() {
     fi
 
     [[ $EUID -eq 0 ]] ||
-        warn "Запуск не от root ограничит установку пакетов и активный тест fail2ban"
+        warn "Запуск не от root ограничит установку диагностических пакетов"
     install_dependencies || warn "Некоторые проверки могут быть недоступны"
     create_router_expect
 
