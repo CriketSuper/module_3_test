@@ -52,7 +52,7 @@ else
 fi
 
 declare -A RESULT_SCORE RESULT_TITLE RESULT_DETAIL
-TOTAL_HALF_POINTS=0
+TOTAL_POINTS=0
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf -- "$TMP_DIR"' EXIT
 
@@ -75,8 +75,8 @@ set_result() {
     RESULT_DETAIL["$number"]="$detail"
 
     case "$score" in
-        1) TOTAL_HALF_POINTS=$((TOTAL_HALF_POINTS + 2)) ;;
-        0.5) TOTAL_HALF_POINTS=$((TOTAL_HALF_POINTS + 1)) ;;
+        2) TOTAL_POINTS=$((TOTAL_POINTS + 2)) ;;
+        1) TOTAL_POINTS=$((TOTAL_POINTS + 1)) ;;
     esac
 }
 
@@ -343,9 +343,9 @@ printf 'TOTAL:%s\nFOUND:%s\nFIRST:%s\nPASS64:%s\n' \
     fi
 
     if ((total > 0 && found == total)) && [[ "$visible$auth" == yesyes ]]; then
-        set_result 1 1 "$title" "$found пользователей импортированы, NSS и Kerberos-вход работают"
+        set_result 1 2 "$title" "$found пользователей импортированы, NSS и Kerberos-вход работают"
     elif ((found > 0)); then
-        set_result 1 0.5 "$title" "Найдено $found из $total пользователей, вход подтверждён не полностью"
+        set_result 1 1 "$title" "Найдено $found из $total пользователей, вход подтверждён не полностью"
     else
         set_result 1 0 "$title" "Импортированные пользователи не обнаружены"
     fi
@@ -418,9 +418,9 @@ fi
     fi
 
     if [[ "$ca_ok$cert_ok$trust_ok$gost" == yesyesyesyes ]]; then
-        set_result 2 1 "$title" "GOST-сертификат установлен, оба HTTPS-сайта доверены"
+        set_result 2 2 "$title" "GOST-сертификат установлен, оба HTTPS-сайта доверены"
     elif [[ "$ca_ok$cert_ok$trust_ok" == yesyesyes ]]; then
-        set_result 2 0.5 "$title" "PKI и доверенный HTTPS работают, но сертификат использует не GOST"
+        set_result 2 1 "$title" "PKI и доверенный HTTPS работают, но сертификат использует не GOST"
     else
         set_result 2 0 "$title" \
             "PKI: $ca_ok, сертификат: $cert_ok, HTTPS: web=$web_code docker=$docker_code"
@@ -465,9 +465,9 @@ check_3_ipsec() {
     sa_active "$br_sa" "$HQ_RTR_WAN_IP" && br_active=yes
 
     if [[ "$hq_ok$br_ok$hq_active$br_active" == yesyesyesyes ]]; then
-        set_result 3 1 "$title" "IPsec настроен с обеих сторон, SA активны"
+        set_result 3 2 "$title" "IPsec настроен с обеих сторон, SA активны"
     elif [[ "$hq_ok" == yes || "$br_ok" == yes ]]; then
-        set_result 3 0.5 "$title" "IPsec сконфигурирован не полностью или SA не установлены"
+        set_result 3 1 "$title" "IPsec сконфигурирован не полностью или SA не установлены"
     else
         set_result 3 0 "$title" "Конфигурация IPsec не обнаружена"
     fi
@@ -587,11 +587,11 @@ check_4_firewall() {
     br_detail="$(firewall_router_detail "$br_config")"
 
     if [[ "$hq_ok$br_ok" == yesyes ]]; then
-        set_result 4 1 "$title" \
+        set_result 4 2 "$title" \
             "HQ-RTR и BR-RTR: WAN-фильтр разрешает http, https, dns, ntp и icmp; остальное блокируется политикой фильтра"
     elif [[ "$hq_ok" == yes || "$br_ok" == yes ]] ||
         { contains "$hq_config" "$FIREWALL_MAP" && contains "$br_config" "$FIREWALL_MAP"; }; then
-        set_result 4 0.5 "$title" \
+        set_result 4 1 "$title" \
             "HQ-RTR: $hq_detail; BR-RTR: $br_detail"
     else
         set_result 4 0 "$title" \
@@ -626,9 +626,9 @@ ss -lnt 2>/dev/null | grep -q ':$CUPS_SERVER_PORT ' && echo LISTEN:yes
     fi
 
     if [[ "$server_ok$client_ok" == yesyes ]]; then
-        set_result 5 1 "$title" "PDF-принтер опубликован и установлен на HQ-CLI по умолчанию"
+        set_result 5 2 "$title" "PDF-принтер опубликован и установлен на HQ-CLI по умолчанию"
     elif [[ "$server_ok" == yes ]]; then
-        set_result 5 0.5 "$title" \
+        set_result 5 1 "$title" \
             "Сервер работает; очередь HQ-CLI или принтер по умолчанию не подтверждены"
     else
         set_result 5 0 "$title" \
@@ -680,9 +680,9 @@ cat /etc/rsyslog.d/30-au-team-forward-warning.conf 2>/dev/null || true
 
     if ((found == 3 && router_clients == 2)) &&
         [[ "$listener$br_client$self_log" == yesyesno ]]; then
-        set_result 6 1 "$title" "Логи HQ-RTR, BR-RTR и BR-SRV размещены в отдельных каталогах"
+        set_result 6 2 "$title" "Логи HQ-RTR, BR-RTR и BR-SRV размещены в отдельных каталогах"
     elif ((found >= 1)) || [[ "$listener$br_client" == yesyes ]]; then
-        set_result 6 0.5 "$title" "Центральный сбор работает частично; найдено источников: $found из 3"
+        set_result 6 1 "$title" "Центральный сбор работает частично; найдено источников: $found из 3"
     else
         set_result 6 0 "$title" "Централизованный сбор логов не подтверждён"
     fi
@@ -713,10 +713,10 @@ logrotate -d /etc/logrotate.d/au-team-remote 2>&1 || true
     contains "$output" "/usr/sbin/logrotate" && scheduler=yes
 
     if [[ "$weekly$size$compress$path$scheduler" == yesyesyesyesyes ]]; then
-        set_result 7 1 "$title" "Еженедельная ротация, сжатие и порог $ROTATE_SIZE настроены"
+        set_result 7 2 "$title" "Еженедельная ротация, сжатие и порог $ROTATE_SIZE настроены"
     elif [[ "$exists" == yes ]] &&
         { [[ "$weekly" == yes ]] || [[ "$compress" == yes ]] || [[ "$size" == yes ]]; }; then
-        set_result 7 0.5 "$title" "Ротация настроена, но параметры отличаются от задания"
+        set_result 7 1 "$title" "Ротация настроена, но параметры отличаются от задания"
     else
         set_result 7 0 "$title" "Политика ротации не обнаружена"
     fi
@@ -755,9 +755,9 @@ docker exec grafana sh -c 'grep -R -E \"CPU usage|Memory usage|Root filesystem u
 
     if ((containers == 3 && targets >= 2 && panels == 3)) &&
         [[ "$login$dns" == yesyes ]]; then
-        set_result 8 1 "$title" "HQ-SRV и BR-SRV доступны, CPU, RAM и диск отображаются"
+        set_result 8 2 "$title" "HQ-SRV и BR-SRV доступны, CPU, RAM и диск отображаются"
     elif ((containers >= 2 && targets >= 1)) || [[ "$login" == yes ]]; then
-        set_result 8 0.5 "$title" \
+        set_result 8 1 "$title" \
             "Контейнеры=$containers/3, targets=$targets/2, панели=$panels/3, DNS=$dns, вход=$login"
     else
         set_result 8 0 "$title" \
@@ -788,10 +788,10 @@ done
         contains "$output" "$HQ_CLI_IP" && cli_report=yes
 
     if [[ "$playbook$hq_report$cli_report" == yesyesyes ]]; then
-        set_result 9 1 "$title" "Созданы корректные YAML-отчёты HQ-SRV и HQ-CLI"
+        set_result 9 2 "$title" "Созданы корректные YAML-отчёты HQ-SRV и HQ-CLI"
     elif [[ "$playbook" == yes ]] &&
         { [[ "$hq_report" == yes ]] || [[ "$cli_report" == yes ]]; }; then
-        set_result 9 0.5 "$title" "Плейбук работает, но корректен только один отчёт"
+        set_result 9 1 "$title" "Плейбук работает, но корректен только один отчёт"
     else
         set_result 9 0 "$title" "Механизм инвентаризации не обнаружен"
     fi
@@ -898,8 +898,8 @@ widths = [
 ]
 
 colors = {
-    "1": os.environ.get("TABLE_C_GREEN", ""),
-    "0.5": os.environ.get("TABLE_C_YELLOW", ""),
+    "2": os.environ.get("TABLE_C_GREEN", ""),
+    "1": os.environ.get("TABLE_C_YELLOW", ""),
     "0": os.environ.get("TABLE_C_RED", ""),
 }
 reset = os.environ.get("TABLE_C_RESET", "")
@@ -921,11 +921,8 @@ PY
         column -t -s $'\t' "$table_file"
     fi
 
-    total="$((TOTAL_HALF_POINTS / 2))"
-    if ((TOTAL_HALF_POINTS % 2)); then
-        total="${total}.5"
-    fi
-    printf '\n%sИтого: %s / 9 баллов%s\n' "$C_BOLD" "$total" "$C_RESET"
+    total="$TOTAL_POINTS"
+    printf '\n%sИтого: %s / 18 баллов%s\n' "$C_BOLD" "$total" "$C_RESET"
 }
 
 self_test() {
@@ -933,8 +930,8 @@ self_test() {
     for number in 1 2 3 4 5 6 7 8 9; do
         case $((number % 3)) in
             0) set_result "$number" 0 "Тестовый критерий $number" "Ошибка" ;;
-            1) set_result "$number" 1 "Тестовый критерий $number" "Соответствует" ;;
-            2) set_result "$number" 0.5 "Тестовый критерий $number" "Частично" ;;
+            1) set_result "$number" 2 "Тестовый критерий $number" "Соответствует" ;;
+            2) set_result "$number" 1 "Тестовый критерий $number" "Частично" ;;
         esac
     done
     print_results
